@@ -35,6 +35,35 @@ from submissions.analytical_placer.smooth_objectives import (
 )
 
 
+def _try_load_plc_for(benchmark: Benchmark):
+    """
+    Best-effort load of a PlacementCost object for this benchmark so we can
+    rank final candidates with the *real* proxy cost (not a smooth surrogate).
+
+    Returns the plc, or None if the on-disk testcase directory cannot be found
+    (non-IBM custom benchmarks, ad-hoc calls, etc.). Callers must fall back to
+    the smooth scorer in that case.
+    """
+    try:
+        from macro_place.loader import load_benchmark_from_dir  # local import keeps module import cheap
+    except Exception:
+        return None
+
+    # Known on-disk locations for the standard IBM testcases. Extend here if
+    # new benchmark families get supported.
+    candidate_dirs = [
+        Path("external/MacroPlacement/Testcases/ICCAD04") / benchmark.name,
+    ]
+    for d in candidate_dirs:
+        if (d / "netlist.pb.txt").exists():
+            try:
+                _, plc = load_benchmark_from_dir(str(d))
+                return plc
+            except Exception:
+                return None
+    return None
+
+
 def _detect_device() -> torch.device:
     """Select best available device: mps > cuda > cpu."""
     if torch.backends.mps.is_available():
@@ -54,7 +83,7 @@ class AnalyticalPlacer:
         self,
         seed: int = 42,
         batch_size: int = 32,
-        top_m: int = 1,
+        top_m: int = 4,
         nesterov_iters: int = 1000,
         refine_iters: int = 400,
         lr_init: float = 0.5,
@@ -101,11 +130,53 @@ class AnalyticalPlacer:
             )
             refined.append(refined_i)
 
-        # Phase 4: Score and select best via smooth objectives
-        best_idx = self._select_best(benchmark, refined)
-        if self.verbose and M > 1:
+        # Phase 4: Select best FINAL candidate. Prefer real proxy cost when we
+        # can load a PlacementCost for this benchmark; fall back to the smooth
+        # surrogate otherwise.
+        if M == 1:
+            return refined[0]
+
+        best_idx = None
+        if M > 1:
+            plc = _try_load_plc_for(benchmark)
+            if plc is not None:
+                best_idx, scores = self._select_best_real(benchmark, plc, refined)
+                if self.verbose:
+                    print(
+                        f"  [select] real-proxy scores: "
+                        f"{[f'{s:.4f}' for s in scores]}"
+                    )
+            else:
+                best_idx = self._select_best(benchmark, refined)
+                if self.verbose:
+                    print("  [select] (no PlacementCost available — used smooth surrogate)")
+
+        if self.verbose:
             print(f"  Best candidate: {best_idx + 1}/{M}")
         return refined[best_idx]
+
+    def _select_best_real(
+        self,
+        benchmark: Benchmark,
+        plc,
+        candidates: list,
+    ) -> tuple[int, list[float]]:
+        """Rank final refined candidates by the *true* proxy cost."""
+        from macro_place.objective import compute_proxy_cost
+
+        scores: list[float] = []
+        for c in candidates:
+            try:
+                costs = compute_proxy_cost(c, benchmark, plc)
+                scores.append(float(costs["proxy_cost"]))
+            except Exception as e:
+                # If proxy cost fails for any candidate, fall through with +inf
+                # so it gets dropped from consideration.
+                if self.verbose:
+                    print(f"  [select] proxy cost failed for a candidate: {e}")
+                scores.append(float("inf"))
+        best = int(min(range(len(scores)), key=lambda i: scores[i]))
+        return best, scores
 
     def _select_best(self, benchmark: Benchmark, candidates: list) -> int:
         """Score each candidate via smooth objectives; return best index."""

@@ -61,13 +61,27 @@ class NesterovSolver:
         self, base: torch.Tensor, canvas_diag: float, lo: torch.Tensor, hi: torch.Tensor
     ) -> torch.Tensor:
         """
-        Create B perturbed copies of base positions.
+        Create B structurally diverse initial positions.
+
+        The goal is to explore different basins of the non-convex landscape,
+        not just jitter around one solution. Layout of the batch dimension:
+
+            [0]            original positions (keeps the given init on the table)
+            [1 : 1+nS]     small Gaussian perturbation (exploit local basin)
+            [1+nS : 1+nS+nM]  medium Gaussian perturbation (broaden basin)
+            [... : ... + nU]  uniform random over the whole canvas
+            [... : ... + nC]  clustered near each of the 4 canvas corners
+            [... : ... + nX]  clustered near the canvas center
+            [... : end]    large noise on original (last-resort exploration)
+
+        Widths nS, nM, nU, nC, nX, nL scale with B so every basin gets some
+        budget regardless of batch size.
 
         Args:
             base: [N, 2] — original positions.
             canvas_diag: canvas diagonal for noise scaling.
-            lo: [N, 2] — lower clamp bounds.
-            hi: [N, 2] — upper clamp bounds.
+            lo: [N, 2] — lower clamp bounds (≥ half-size of each macro).
+            hi: [N, 2] — upper clamp bounds (≤ canvas − half-size).
 
         Returns:
             [B, N, 2] — batched initial positions, clamped to bounds.
@@ -75,23 +89,108 @@ class NesterovSolver:
         B = self.batch_size
         N = base.size(0)
         device = base.device
+        dtype = base.dtype
 
         batch = base.unsqueeze(0).expand(B, -1, -1).clone()  # [B, N, 2]
 
-        # Batch 0: original (no noise)
-        # Batches 1-3: small perturbation
-        if B > 1:
-            n_small = min(3, B - 1)
-            noise_small = torch.randn(n_small, N, 2, device=device) * (0.05 * canvas_diag)
-            batch[1 : 1 + n_small] += noise_small
+        if B <= 1:
+            return batch
 
-        # Batches 4-7: larger perturbation
-        if B > 4:
-            n_large = B - 4
-            noise_large = torch.randn(n_large, N, 2, device=device) * (0.15 * canvas_diag)
-            batch[4 : 4 + n_large] += noise_large
+        # Canvas extents derived from clamp bounds (lo and hi already account
+        # for per-macro half-sizes, so using the min/max is safe).
+        canvas_min = lo.min(dim=0).values  # [2]
+        canvas_max = hi.max(dim=0).values  # [2]
+        canvas_span = canvas_max - canvas_min  # [2]
+        canvas_center = 0.5 * (canvas_min + canvas_max)  # [2]
 
-        # Clamp all to canvas bounds
+        # Allocate batch slots. Always keep slot 0 = original.
+        # Shape budgets:
+        #   1   original
+        #   ~10%  small perturbation  (≥1 if B>=2)
+        #   ~15%  medium perturbation (≥1 if B>=4)
+        #   ~25%  uniform random over canvas
+        #   ~20%  4-corner clusters (equal share per corner)
+        #   ~10%  center cluster (tight near middle)
+        #   rest  large perturbation on original
+        def _budget(frac: float, minimum: int = 1) -> int:
+            return max(minimum, int(round(frac * B)))
+
+        idx = 1  # slot 0 is reserved for "original"
+        remaining = B - idx
+
+        n_small  = min(remaining, _budget(0.10))
+        remaining -= n_small
+
+        n_medium = min(remaining, _budget(0.15))
+        remaining -= n_medium
+
+        n_uniform = min(remaining, _budget(0.25))
+        remaining -= n_uniform
+
+        # Corner clusters are always 4-way (one per corner) if we have ≥4 slots
+        n_corner = min(remaining, max(0, (_budget(0.20) // 4) * 4))
+        remaining -= n_corner
+
+        n_center = min(remaining, _budget(0.10))
+        remaining -= n_center
+
+        # Anything left goes to large-noise exploration
+        n_large = remaining
+
+        # ── Small perturbation ───────────────────────────────────────────────
+        if n_small > 0:
+            noise = torch.randn(n_small, N, 2, device=device, dtype=dtype) * (0.05 * canvas_diag)
+            batch[idx : idx + n_small] += noise
+            idx += n_small
+
+        # ── Medium perturbation ──────────────────────────────────────────────
+        if n_medium > 0:
+            noise = torch.randn(n_medium, N, 2, device=device, dtype=dtype) * (0.15 * canvas_diag)
+            batch[idx : idx + n_medium] += noise
+            idx += n_medium
+
+        # ── Uniform random over the canvas ───────────────────────────────────
+        if n_uniform > 0:
+            rnd = torch.rand(n_uniform, N, 2, device=device, dtype=dtype)
+            batch[idx : idx + n_uniform] = canvas_min + rnd * canvas_span
+            idx += n_uniform
+
+        # ── 4-corner clusters ────────────────────────────────────────────────
+        if n_corner > 0:
+            per_corner = n_corner // 4
+            # Corner anchors at ~¼ canvas span in from each corner
+            q = 0.25 * canvas_span
+            anchors = torch.stack(
+                [
+                    canvas_min + q,                                          # bottom-left
+                    torch.tensor([canvas_max[0] - q[0], canvas_min[1] + q[1]], device=device, dtype=dtype),  # bottom-right
+                    torch.tensor([canvas_min[0] + q[0], canvas_max[1] - q[1]], device=device, dtype=dtype),  # top-left
+                    canvas_max - q,                                          # top-right
+                ],
+                dim=0,
+            )  # [4, 2]
+            cluster_sigma = 0.15 * canvas_diag
+            for k in range(4):
+                n_k = per_corner
+                if n_k == 0:
+                    continue
+                noise = torch.randn(n_k, N, 2, device=device, dtype=dtype) * cluster_sigma
+                batch[idx : idx + n_k] = anchors[k] + noise
+                idx += n_k
+
+        # ── Center cluster ───────────────────────────────────────────────────
+        if n_center > 0:
+            noise = torch.randn(n_center, N, 2, device=device, dtype=dtype) * (0.10 * canvas_diag)
+            batch[idx : idx + n_center] = canvas_center + noise
+            idx += n_center
+
+        # ── Large perturbation on original ───────────────────────────────────
+        if n_large > 0:
+            noise = torch.randn(n_large, N, 2, device=device, dtype=dtype) * (0.30 * canvas_diag)
+            batch[idx : idx + n_large] = base.unsqueeze(0) + noise
+            idx += n_large
+
+        # Clamp all to valid per-macro bounds
         batch.clamp_(min=lo.unsqueeze(0), max=hi.unsqueeze(0))
         return batch
 
@@ -203,10 +302,17 @@ class NesterovSolver:
                     soft_pos.grad.zero_()
 
             if self.verbose and (step % 100 == 0 or step == self.num_iters - 1):
+                # Show per-component contribution so the density ramp isn't
+                # mistaken for solver divergence.
+                wl_m = wl.mean().item()
+                den_m = den.mean().item()
+                rep_m = rep.mean().item()
                 print(
-                    f"  [step {step:4d}] loss(mean)={loss.mean().item():.4f}  "
-                    f"wl={wl.mean().item():.4f}  den={den.mean().item():.4f}  "
-                    f"rep={rep.mean().item():.6f}  lr={lr:.4f}  γ={gamma:.2f}  λr={lam_r:.2f}"
+                    f"  [step {step:4d}] "
+                    f"wl={wl_m:.4f}  "
+                    f"den={den_m:.4f} (λd·den={lam_d*den_m:.3f})  "
+                    f"rep={rep_m:.6f} (λr·rep={lam_r*rep_m:.4f})  "
+                    f"lr={lr:.4f}  γ={gamma:.2f}"
                 )
 
         # Score all B candidates: 1.0*WL + 0.5*Density + 0.1*Overlap
