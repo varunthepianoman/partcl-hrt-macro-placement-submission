@@ -83,7 +83,7 @@ class AnalyticalPlacer:
         self,
         seed: int = 42,
         batch_size: int = 32,
-        top_m: int = 4,
+        top_m: int = 1,
         nesterov_iters: int = 1000,
         refine_iters: int = 400,
         lr_init: float = 0.5,
